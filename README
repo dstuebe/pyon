@@ -28,9 +28,11 @@ For Mac, use homebrew
 - rabbitmq 2.6.1 or later (recommended, but can use rabbitmq on amoeba)
     Use brew.
     Alternative: download generic Linux version and unpack into a suitable directory.
-- Install libevent, libyaml, zeromq, couchdb, python, and rabbitmq with Homebrew
-    > brew install libevent libyaml zeromq couchdb python rabbitmq
+- Install libevent, libyaml, couchdb, python, and rabbitmq with Homebrew
+    > brew install libevent libyaml couchdb python rabbitmq hdf5
     You can even reinstall git using brew to clean up your /usr/local directory
+    (If you have trouble with brew 'MD5 mismatch' errors, try running 'brew update' 
+    and try the install again)
     Linux: Note that many installs have much older versions installed by default.
       - libevent: Install with package manager
       - libyaml: You need the -dev or -devel version. If you don't have such a package, use extern/setup-libyaml.sh
@@ -66,6 +68,14 @@ Link git submodule ion-definitions, containing object and service definitions an
     git submodule update --init
 
 Note: This git-submodule always references a specific commit of ion-definitions used by pyon.
+
+Hint: The .gitmodules file  declares the submodule as read only GIT reference (https: instead of git@).
+    If you have problems with a read only (anonymous) clone because of a missing public key,
+    edit .git/config and change the last url to git://github.com/ooici/ion-definitions.git
+
+    If you want to avoid entering your password for every push to the submodule,
+    edit extern/ion-definitions/.git/config and change the remote reference to:
+    git@github.com:ooici/ion-definitions.git
 
 To update the code in pyon and the specific commit in the submodule:
     > git pull
@@ -167,6 +177,12 @@ Remote debugging of services in a running container is possible too. Setup a rem
 configuration to use the localhost and port 8585. First start the remote debuging server, then
 start the container from the command line below (the -n seems to be required)
     > bin/pyccd -n --rel res/deploy/r2services.yml
+
+
+DATASTORE
+=========
+
+View and manipulate the CouchDB datastore, by accessing http://localhost:5984/_utils
 
 
 EXAMPLES

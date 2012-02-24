@@ -28,7 +28,9 @@ setup(  name = 'pyon',
             'console_scripts' : [
                 'pycc=scripts.pycc:entry',
                 'control_cc=scripts.control_cc:main',
-                'generate_interfaces=scripts.generate_interfaces:main'
+                'generate_interfaces=scripts.generate_interfaces:main',
+                'json_report=scripts.json_report:main',
+                'clear_couch=pyon.datastore.clear_couch_util:main',
                 ]
             },
         dependency_links = [
@@ -44,7 +46,7 @@ setup(  name = 'pyon',
             'setproctitle==1.1.2',
             'pyyaml==3.10',
             'pika==0.9.5',
-            'httplib2==0.7.1',
+            'httplib2==0.7.2',
             'pyzmq==2.1.7',
             'gevent_zeromq==0.2.0',
             'zope.interface',
@@ -57,14 +59,13 @@ setup(  name = 'pyon',
             'ipython==0.11',
             'readline==6.2.1',
             'mock',
-            'ndg-xacml==0.4.0'
+            'ndg-xacml==0.4.0',
+            'h5py==2.0.1', # see: http://www.hdfgroup.org/HDF5/release/obtain5.html
+
             # DM related dependencies for 'tables'
             # 'numpy==1.6.1',
             # 'numexpr==1.4.2',
             # 'cython==0.14.1',
-# Uncomment only after manually installing HDF5 package
-# see: http://www.hdfgroup.org/HDF5/release/obtain5.html
-#            'h5py==2.0.1',
-#            'tables==2.3',
+            # 'tables==2.3',
         ],
      )

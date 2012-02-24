@@ -10,7 +10,7 @@ from zope.interface.interface import Interface
 from pyon.core import exception
 from pyon.net import endpoint
 from pyon.net.channel import BaseChannel, SendChannel, BidirClientChannel, SubscriberChannel, ChannelClosedError, ServerChannel
-from pyon.net.endpoint import EndpointUnit, BaseEndpoint, RPCServer, Subscriber, Publisher, RequestResponseClient, RequestEndpointUnit, RPCRequestEndpointUnit, RPCClient, RPCResponseEndpointUnit
+from pyon.net.endpoint import EndpointUnit, BaseEndpoint, RPCServer, Subscriber, Publisher, RequestResponseClient, RequestEndpointUnit, RPCRequestEndpointUnit, RPCClient, RPCResponseEndpointUnit, EndpointError
 from gevent import event, sleep
 from pyon.net.messaging import NodeB
 from pyon.service.service import BaseService
@@ -19,12 +19,13 @@ from nose.plugins.attrib import attr
 from mock import Mock, sentinel, patch
 
 # NO INTERCEPTORS - we use these mock-like objects up top here which deliver received messages that don't go through the interceptor stack.
-endpoint.interceptors = {'message-in': [],
-                         'message-out': [],
-                         'process-in': [],
-                         'process-out': []}
+no_interceptors = {'message-in': [],
+                   'message-out': [],
+                   'process-in': [],
+                   'process-out': []}
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestEndpointUnit(PyonTestCase):
 
     def setUp(self):
@@ -99,14 +100,13 @@ class TestEndpointUnit(PyonTestCase):
         self.assertTrue(self._endpoint_unit.message_received.called)
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestBaseEndpoint(PyonTestCase):
     def setUp(self):
         self._node = Mock(spec=NodeB)
         self._ef = BaseEndpoint(node=self._node, name="EFTest")
         self._ch = Mock(spec=SendChannel)
-        chtype = Mock()
-        chtype.return_value = self._ch
-        self._ef.channel_type = chtype
+        self._node.channel.return_value = self._ch
 
     def test_create_endpoint(self):
         e = self._ef.create_endpoint()
@@ -153,25 +153,45 @@ class TestBaseEndpoint(PyonTestCase):
         self.assertTrue(hasattr(e, "_opt"))
         self.assertEquals(e._opt, "stringer")
 
+    def test__ensure_node_errors(self):
+        bep = BaseEndpoint(name=sentinel.name)
+        gcimock = Mock()
+        gcimock.return_value = None
+        with patch('pyon.net.endpoint.BaseEndpoint._get_container_instance', gcimock):
+            self.assertRaises(EndpointError, bep._ensure_node)
+
+    @patch('pyon.net.endpoint.BaseEndpoint._get_container_instance')
+    def test__ensure_node_existing_node(self, gcimock):
+        self._ef._ensure_node()
+        self.assertFalse(gcimock.called)
+
+    @patch('pyon.net.endpoint.BaseEndpoint._get_container_instance')
+    def test__ensure_node(self, gcimock):
+        bep = BaseEndpoint(name=sentinel.name)
+        self.assertIsNone(bep.node)
+
+        bep._ensure_node()
+
+        self.assertEquals(bep.node, gcimock().node)
+
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestPublisher(PyonTestCase):
     def setUp(self):
         self._node = Mock(spec=NodeB)
         self._pub = Publisher(node=self._node, name="testpub")
         self._ch = Mock(spec=SendChannel)
-        chtype = Mock()
-        chtype.return_value = self._ch
-        self._pub.channel_type = chtype
+        self._node.channel.return_value = self._ch
 
     def test_publish(self):
         self.assertEquals(self._node.channel.call_count, 0)
 
         self._pub.publish("pub")
 
-        self._node.channel.assert_called_once_with(self._ch)
+        self._node.channel.assert_called_once_with(self._pub.channel_type)
         self.assertEquals(self._ch.send.call_count, 1)
 
         self._pub.publish("pub2")
-        self._node.channel.assert_called_once_with(self._ch)
+        self._node.channel.assert_called_once_with(self._pub.channel_type)
         self.assertEquals(self._ch.send.call_count, 2)
 
 class RecvMockMixin(object):
@@ -204,6 +224,7 @@ class RecvMockMixin(object):
         return ch
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestSubscriber(PyonTestCase, RecvMockMixin):
 
     def setUp(self):
@@ -231,7 +252,7 @@ class TestSubscriber(PyonTestCase, RecvMockMixin):
 
         # tell the subscriber to create this as the main listening channel
         listen_channel_mock = self._setup_mock_channel(ch_type=SubscriberChannel, value="subbed", error_message="")
-        sub._create_main_channel = lambda: listen_channel_mock
+        sub.node.channel.return_value = listen_channel_mock
 
         # tell our channel to return itself when accepted
         listen_channel_mock.accept.return_value = listen_channel_mock
@@ -243,6 +264,7 @@ class TestSubscriber(PyonTestCase, RecvMockMixin):
         cbmock.assert_called_once_with('subbed', {'status_code':200, 'error_message':'', 'op': None})
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestRequestResponse(PyonTestCase, RecvMockMixin):
     def setUp(self):
         self._node = Mock(spec=NodeB)
@@ -262,9 +284,7 @@ class TestRequestResponse(PyonTestCase, RecvMockMixin):
         """
         """
         rr = RequestResponseClient(node=self._node, name="rr")
-        chtype = Mock()
-        chtype.return_value = self._setup_mock_channel()
-        rr.channel_type = chtype
+        rr.node.channel.return_value = self._setup_mock_channel()
 
         ret = rr.request("request")
         self.assertEquals(ret, "bidirmsg")
@@ -294,6 +314,7 @@ class SimpleService(BaseService):
         return True
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestRPCRequestEndpoint(PyonTestCase, RecvMockMixin):
 
     def test_build_msg(self):
@@ -325,6 +346,7 @@ class TestRPCRequestEndpoint(PyonTestCase, RecvMockMixin):
             self.assertRaises(err, e.send, 'payload')
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestRPCClient(PyonTestCase, RecvMockMixin):
 
     @patch('pyon.net.endpoint.IonObject')
@@ -332,9 +354,7 @@ class TestRPCClient(PyonTestCase, RecvMockMixin):
         node = Mock(spec=NodeB)
 
         rpcc = RPCClient(node=node, name="simply", iface=ISimpleInterface)
-        chtype = Mock()
-        chtype.return_value = self._setup_mock_channel()
-        rpcc.channel_type = chtype
+        rpcc.node.channel.return_value = self._setup_mock_channel()
 
         self.assertTrue(hasattr(rpcc, 'simple'))
 
@@ -348,6 +368,7 @@ class TestRPCClient(PyonTestCase, RecvMockMixin):
         self.assertRaises(AssertionError, rpcc.simple, "zap", "zip")
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestRPCResponseEndpoint(PyonTestCase, RecvMockMixin):
 
     def simple(self, named=None):
@@ -393,7 +414,13 @@ class TestRPCResponseEndpoint(PyonTestCase, RecvMockMixin):
                                                'error_message':'Unknown op name: no_exist',
                                                'conv-id': '',
                                                'conv-seq': 2,
-                                               'protocol':''})
+                                               'protocol':'',
+                                               'performative': 'failure',
+                                               'language':'ion-r2',
+                                               'encoding':'msgpack',
+                                               'format':'NoneType',
+                                               'receiver': ',',
+                                               'reply-by': 'todo'})
 
     def test_recv_bad_kwarg(self):
         # we try to call simple with the kwarg "not_named" instead of the correct one
@@ -414,7 +441,13 @@ class TestRPCResponseEndpoint(PyonTestCase, RecvMockMixin):
                                                'error_message':'simple() got an unexpected keyword argument \'not_named\'',
                                                'conv-id': '',
                                                'conv-seq': 2,
-                                               'protocol':''})
+                                               'protocol':'',
+                                               'performative': 'failure',
+                                               'language':'ion-r2',
+                                               'encoding':'msgpack',
+                                               'format':'NoneType',
+                                               'receiver': ',',
+                                               'reply-by': 'todo'})
 
     def test__message_received_interceptor_exception(self):
         e = RPCResponseEndpointUnit(routing_obj=self)
@@ -428,7 +461,8 @@ class TestRPCResponseEndpoint(PyonTestCase, RecvMockMixin):
                                                   'error_message':'',
                                                   'conv-id': '',
                                                   'conv-seq': 2,
-                                                  'protocol':''})
+                                                  'protocol':'',
+                                                  'performative': 'failure'})
 
     def error_op(self):
         """
@@ -454,13 +488,15 @@ class TestRPCResponseEndpoint(PyonTestCase, RecvMockMixin):
         e._recv_greenlet.join()
 
         e.send.assert_called_once_with(None, {'status_code': 401,
-                                              'error_message': sentinel.unauth,
+                                              'error_message': str(sentinel.unauth),
                                               'conv-id': '',
                                               'conv-seq': 2,
-                                              'protocol':''})
+                                              'protocol':'',
+                                              'performative':'failure'})
 
 
 @attr('UNIT')
+@patch.dict(endpoint.interceptors, no_interceptors, clear=True)
 class TestRPCServer(PyonTestCase, RecvMockMixin):
 
     def test_rpc_server(self):
@@ -475,7 +511,7 @@ class TestRPCServer(PyonTestCase, RecvMockMixin):
         cvalue = FakeMsg()
 
         listen_channel_mock = self._setup_mock_channel(ch_type=ServerChannel)
-        rpcs._create_main_channel = lambda: listen_channel_mock
+        rpcs.node.channel.return_value = listen_channel_mock
 
         # tell our channel to return a mocked handler channel when accepted (listen() implementation detail)
         listen_channel_mock.accept.return_value = self._setup_mock_channel(ch_type=ServerChannel.BidirAcceptChannel, value=cvalue, op="simple")

@@ -14,9 +14,6 @@ SERVICE_UNAVAILABLE = 503
 class IonException(Exception):
     status_code = -1
 
-    def __init__(self, message=''):
-        self.message = message
-
     def get_status_code(self):
         return self.status_code
 
@@ -100,3 +97,11 @@ class ContainerAppError(ContainerError):
     '''
     '''
     status_code = 554
+
+exception_map = {}
+import inspect
+import sys
+for name, obj in inspect.getmembers(sys.modules[__name__]):
+    if inspect.isclass(obj):
+        if hasattr(obj, "status_code"):
+            exception_map[str(obj.status_code)] = obj

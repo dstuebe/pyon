@@ -17,7 +17,8 @@ The Channel Protocol mediates between the application using it and the amqp
 protocol underlying it...so the Channel Protocol is a transport protocol in
 the language of amqp methods and ooi exchange nomenclature.
 
-The Channel Protocol doesn't make a lot of sense for the 'interactive'
+The Channel Protocol doesn't
+make a lot of sense for the 'interactive'
 style client methods, like accept, or listen.
 Listen kind of does, it says go into listening mode.
 If the Channel Protocol is a state machine, then it's states are being
@@ -38,10 +39,11 @@ point will ack when the content of a delivery naturally concludes (channel
 is closed)
 """
 
-from pyon.util.async import blocking_cb
 from pyon.util.log import log
 from pika import BasicProperties
 from gevent import queue as gqueue
+from contextlib import contextmanager
+from gevent.event import AsyncResult
 
 class ChannelError(StandardError):
     """
@@ -61,6 +63,7 @@ class BaseChannel(object):
 
     _amq_chan                   = None      # underlying transport
     _close_callback             = None      # close callback to use when closing, not always set (used for pooling)
+    _closed_error_callback      = None      # callback which triggers when the underlying transport closes with error
     _exchange                   = None      # exchange (too AMQP specific)
 
     # exchange related settings @TODO: these should likely come from config instead
@@ -76,7 +79,26 @@ class BaseChannel(object):
                                 in which case close_impl() will be called. This expects to be a callable taking one
                                 param, this channel instance.
         """
+        self.set_close_callback(close_callback)
+
+    def set_close_callback(self, close_callback):
+        """
+        Sets a callback method to be called when this channel's close method is invoked.
+
+        By default, if no callback is set on this channel, close_impl() is called instead.
+        The close callback is chiefly used to pool channels in the Node.
+
+        @param  close_callback  The callback method. Should be a callable taking one argument, this channel.
+        """
         self._close_callback = close_callback
+
+    def _ensure_amq_chan(self):
+        """
+        Ensures this Channel has been activated with the Node.
+        """
+        log.debug("BaseChannel._ensure_amq_chan (current: %s)", self._amq_chan is not None)
+        if not self._amq_chan:
+            raise ChannelError("No amq_chan attached")
 
     def _declare_exchange_point(self, xp):
         """
@@ -88,10 +110,14 @@ class BaseChannel(object):
         """
         self._exchange = xp
         assert self._exchange
+
+        self._ensure_amq_chan()
+
         # EXCHANGE INTERACTION HERE - use async method to wait for it to finish
         log.debug("Exchange declare: %s, TYPE %s, DUR %s AD %s", self._exchange, self._exchange_type,
                                                                  self._exchange_durable, self._exchange_auto_delete)
-        blocking_cb(self._amq_chan.exchange_declare, 'callback', exchange=self._exchange,
+
+        self._sync_call(self._amq_chan.exchange_declare, 'callback', exchange=self._exchange,
                                                                 type=self._exchange_type,
                                                                 durable=self._exchange_durable,
                                                                 auto_delete=self._exchange_auto_delete)
@@ -101,6 +127,17 @@ class BaseChannel(object):
         Attaches an AMQP channel and indicates this channel is now open.
         """
         self._amq_chan = amq_chan
+
+    def get_channel_id(self):
+        """
+        Gets the underlying AMQP channel's channel identifier (number).
+
+        @return Channel id, or None.
+        """
+        if not self._amq_chan:
+            return None
+
+        return self._amq_chan.channel_number
 
     def close(self):
         """
@@ -121,7 +158,7 @@ class BaseChannel(object):
         """
         Closes the AMQP connection.
         """
-        log.debug("BaseChannel.close_impl")
+        log.debug("BaseChannel.close_impl (%d)", self.get_channel_id())
         if self._amq_chan:
             self._amq_chan.close()
 
@@ -145,14 +182,77 @@ class BaseChannel(object):
         amq_chan.add_on_close_callback(self.on_channel_close)
         self.attach_underlying_channel(amq_chan)
 
+    def set_closed_error_callback(self, callback):
+        """
+        Sets the closed error callback.
+
+        This callback is called when the underlying transport closes early with an error.
+
+        This is typically used for internal operations with the broker and will likely not be
+        used by others.
+
+        @param callback     The callback to trigger. Should take three parameters, this channel, the error code, and the error text.
+        @returns            The former value of the closed error callback.
+        """
+        oldval = self._closed_error_callback
+        self._closed_error_callback = callback
+        return oldval
+
+    @contextmanager
+    def push_closed_error_callback(self, callback):
+        """
+        Context manager based approach to set_closed_error_callback.
+        """
+        cur_cb = self.set_closed_error_callback(callback)
+        try:
+            yield callback
+        finally:
+            self.set_closed_error_callback(cur_cb)
+
     def on_channel_close(self, code, text):
         """
         Callback for when the Pika channel is closed.
         """
         logmeth = log.debug
-        if code != 0:
+        if not (code == 0 or code == 200):
             logmeth = log.error
         logmeth("BaseChannel.on_channel_close\n\tchannel number: %d\n\tcode: %d\n\ttext: %s", self._amq_chan.channel_number, code, text)
+
+        # make callback if it exists!
+        if not (code == 0 or code == 200) and self._closed_error_callback:
+            # run in try block because this can shutter the entire connection
+            try:
+                self._closed_error_callback(self, code, text)
+            except Exception, e:
+                log.warn("Closed error callback caught an exception: %s", str(e))
+
+    def _sync_call(self, func, cb_arg, *args, **kwargs):
+        """
+        Functionally similar to the generic blocking_cb but with error support that's Channel specific.
+        """
+        ar = AsyncResult()
+
+        def cb(*args, **kwargs):
+            ret = list(args)
+            if len(kwargs): ret.append(kwargs)
+            ar.set(ret)
+
+        def eb(ch, code, text):
+            ar.set(ChannelError("_sync_call could not complete due to an error (%d): %s" % (code, text)))
+
+        kwargs[cb_arg] = cb
+        with self.push_closed_error_callback(eb):
+            func(*args, **kwargs)
+            ret_vals = ar.get()
+
+        if isinstance(ret_vals, ChannelError):
+            raise ret_vals
+
+        if len(ret_vals) == 0:
+            return None
+        elif len(ret_vals) == 1:
+            return ret_vals[0]
+        return tuple(ret_vals)
 
 class SendChannel(BaseChannel):
     """
@@ -179,6 +279,8 @@ class SendChannel(BaseChannel):
         exchange, routing_key = name
         headers = headers or {}
         props = BasicProperties(headers=headers)
+
+        self._ensure_amq_chan()
 
         self._amq_chan.basic_publish(exchange=exchange, #todo
                                 routing_key=routing_key, #todo
@@ -221,6 +323,8 @@ class RecvChannel(BaseChannel):
         self._recv_name = name
         self._recv_binding = binding
 
+        self._setup_listener_called = False
+
         BaseChannel.__init__(self, **kwargs)
 
     def setup_listener(self, name=None, binding=None):
@@ -235,21 +339,30 @@ class RecvChannel(BaseChannel):
         Name must be a tuple of (xp, queue). If queue is None, the broker will generate a name e.g. "amq-RANDOMSTUFF".
         Binding may be left none and will use the queue name by default.
 
+        Sets the _setup_listener_called internal flag, so if this method is called multiple times, such as in the case
+        of a pooled channel type, it will not run setup again. Pay attention to this in your override of this method.
+
         @param  name        A tuple of (exchange, queue). Queue may be left None for the broker to generate one.
         @param  binding     If not set, uses name.
         """
+        log.debug('Setup_listener name: %s', name)
         name = name or self._recv_name
         xp, queue = name
 
-        self._recv_name = (xp, queue)
+        log.debug("RecvChannel.setup_listener, xp %s, queue %s, binding %s", xp, queue, binding)
+        if self._setup_listener_called:
+            log.debug("setup_listener already called for this channel")
+            return
 
-        log.debug("RecvChannel.setup_listener, xp %s, queue %s, binding %s" % (xp, queue, binding))
+        self._recv_name = (xp, queue)
 
         self._declare_exchange_point(xp)
         queue   = self._declare_queue(queue)
         binding = binding or self._recv_binding or queue      # last option should only happen in the case of anon-queue
 
         self._bind(binding)
+
+        self._setup_listener_called = True
 
     def destroy_listener(self):
         """
@@ -267,9 +380,11 @@ class RecvChannel(BaseChannel):
         """
         assert self._recv_name and isinstance(self._recv_name, tuple) and self._recv_name[1] and self._recv_binding
 
-        blocking_cb(self._amq_chan.queue_unbind, 'callback', queue=self._recv_name[1],
-                                                             exchange=self._recv_name[0],
-                                                             routing_key=self._recv_binding)
+        self._ensure_amq_chan()
+
+        self._sync_call(self._amq_chan.queue_unbind, 'callback', queue=self._recv_name[1],
+                                                                 exchange=self._recv_name[0],
+                                                                 routing_key=self._recv_binding)
 
     def _destroy_queue(self):
         """
@@ -278,8 +393,10 @@ class RecvChannel(BaseChannel):
         """
         assert self._recv_name and isinstance(self._recv_name, tuple) and self._recv_name[1]
 
+        self._ensure_amq_chan()
+
         log.info("Destroying listener for queue %s", self._recv_name)
-        blocking_cb(self._amq_chan.queue_delete, 'callback', queue=self._recv_name[1])
+        self._sync_call(self._amq_chan.queue_delete, 'callback', queue=self._recv_name[1])
 
     def start_consume(self):
         """
@@ -293,6 +410,8 @@ class RecvChannel(BaseChannel):
 
         if self._consumer_tag and self._queue_auto_delete:
             log.warn("Attempting to start consuming on a queue that may have been auto-deleted")
+
+        self._ensure_amq_chan()
 
         self._consumer_tag = self._amq_chan.basic_consume(self._on_deliver,
                                                           queue=self._recv_name[1],
@@ -311,9 +430,11 @@ class RecvChannel(BaseChannel):
             raise ChannelError("Not consuming")
 
         if self._queue_auto_delete:
-            log.debug("Autodelete is on, this will destroy this queue")
+            log.debug("Autodelete is on, this will destroy this queue: %s", self._recv_name[1])
 
-        blocking_cb(self._amq_chan.basic_cancel, 'callback', self._consumer_tag)
+        self._ensure_amq_chan()
+
+        self._sync_call(self._amq_chan.basic_cancel, 'callback', self._consumer_tag)
         self._consuming = False
 
     def recv(self):
@@ -337,7 +458,8 @@ class RecvChannel(BaseChannel):
         Also put a ChannelShutdownMessage in the recv queue so anything blocking on reading it will get notified via ChannelClosedError.
         """
         # stop consuming if we are consuming
-        log.debug("BaseChannel.close_impl: consuming %s", self._consuming)
+        log.debug("RecvChannel.close_impl (%d): consuming %s", self.get_channel_id(), self._consuming)
+
         if self._consuming:
             self.stop_consume()
 
@@ -350,12 +472,15 @@ class RecvChannel(BaseChannel):
         # prepend xp name in the queue for anti-clobbering
         if queue:
             queue = ".".join([self._recv_name[0], queue])
+            log.debug('Auto-prepending xp to queue name for anti-clobbering: %s', queue)
+
+        self._ensure_amq_chan()
 
         log.debug("RecvChannel._declare_queue: %s", queue)
-        frame = blocking_cb(self._amq_chan.queue_declare, 'callback',
-                            queue=queue or '',
-                            auto_delete=self._queue_auto_delete,
-                            durable=self._queue_durable)
+        frame = self._sync_call(self._amq_chan.queue_declare, 'callback',
+                                                              queue=queue or '',
+                                                              auto_delete=self._queue_auto_delete,
+                                                              durable=self._queue_durable)
 
         # if the queue was anon, save it
         #if queue is None:
@@ -367,12 +492,14 @@ class RecvChannel(BaseChannel):
     def _bind(self, binding):
         log.debug("RecvChannel._bind: %s", binding)
         assert self._recv_name and self._recv_name[1]
+
+        self._ensure_amq_chan()
         
         queue = self._recv_name[1]
-        blocking_cb(self._amq_chan.queue_bind, 'callback',
-                    queue=queue,
-                    exchange=self._recv_name[0],
-                    routing_key=binding)
+        self._sync_call(self._amq_chan.queue_bind, 'callback',
+                                                   queue=queue,
+                                                   exchange=self._recv_name[0],
+                                                   routing_key=binding)
 
         self._recv_binding = binding
 
@@ -394,6 +521,7 @@ class RecvChannel(BaseChannel):
         Should be called by the EP layer.
         """
         log.debug("RecvChannel.ack: %s", delivery_tag)
+        self._ensure_amq_chan()
         self._amq_chan.basic_ack(delivery_tag)
 
     def reject(self, delivery_tag, requeue=False):
@@ -402,19 +530,28 @@ class RecvChannel(BaseChannel):
         Should be called by the EP layer.
         """
         log.debug("RecvChannel.reject: %s", delivery_tag)
-        blocking_cb(self._amq_chan.basic_reject, 'callback', delivery_tag, requeue=requeue)
+        self._ensure_amq_chan()
+        self._sync_call(self._amq_chan.basic_reject, 'callback', delivery_tag, requeue=requeue)
 
-class PubChannel(SendChannel):
-    pass
+class PublisherChannel(SendChannel):
+    def __init__(self, close_callback=None):
+        self._declared = False
+        SendChannel.__init__(self, close_callback=close_callback)
+
+    def send(self, data, headers=None):
+        if not self._declared:
+            assert self._send_name and self._send_name[0]
+            self._declare_exchange_point(self._send_name[0])
+            self._declared = True
+        SendChannel.send(self, data, headers=headers)
 
 class BidirClientChannel(SendChannel, RecvChannel):
     """
     This should be pooled for the receiving side?
 
-    As opposed to current endpoint scheme - no need to spawn a listening greenlet simply to loop on recv(),
+    @TODO: As opposed to current endpoint scheme - no need to spawn a listening greenlet simply to loop on recv(),
     you can use this channel to send first then call recieve linearly, no need for greenletting.
     """
-    _queue_auto_delete  = True
     _consumer_exclusive = True
 
     def _send(self, name, data, headers=None):
@@ -465,6 +602,7 @@ class ListenChannel(RecvChannel):
                     - has the initial received message here put onto its recv gqueue
                     - recv() returns messages in its gqueue, endpoint should ack
         """
+        self._ensure_amq_chan()
         m = self.recv()
         ch = self._create_accepted_channel(self._amq_chan, m)
         ch._recv_queue.put(m)       # prime our recieved message here, should be acked by EP layer

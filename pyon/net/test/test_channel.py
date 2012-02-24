@@ -4,7 +4,7 @@ __author__ = 'Dave Foster <dfoster@asascience.com>'
 __license__ = 'Apache 2.0'
 
 import unittest
-from pyon.net.channel import BaseChannel, SendChannel, RecvChannel, BidirClientChannel, SubscriberChannel, ChannelClosedError, ServerChannel, ChannelError, ChannelShutdownMessage, ListenChannel
+from pyon.net.channel import BaseChannel, SendChannel, RecvChannel, BidirClientChannel, SubscriberChannel, ChannelClosedError, ServerChannel, ChannelError, ChannelShutdownMessage, ListenChannel, PublisherChannel
 from gevent import queue
 from pyon.util.unit_test import PyonTestCase
 from mock import Mock, sentinel, patch
@@ -51,6 +51,7 @@ class TestBaseChannel(PyonTestCase):
 
         self.assertEquals(ch._amq_chan, sentinel.amq_chan)
 
+    @patch('pyon.net.channel.log', Mock())  # to avoid having to put it in signature
     def test_close(self):
         # with close callback
         cbmock = Mock()
@@ -85,6 +86,15 @@ class TestBaseChannel(PyonTestCase):
 
         ch.on_channel_close(0, 'hi')
         ch.on_channel_close(1, 'onoes')
+
+    def test_get_channel_id(self):
+        ch = BaseChannel()
+
+        self.assertTrue(ch.get_channel_id() is None)
+
+        ch._amq_chan = Mock()
+        self.assertEquals(ch.get_channel_id(), ch._amq_chan.channel_number)
+
 
 @attr('UNIT')
 class TestSendChannel(PyonTestCase):
@@ -142,43 +152,64 @@ class TestRecvChannel(PyonTestCase):
         # sub in mocks for _declare_exchange_point, _declare_queue, _bind
         mxp = Mock()
         mdq = Mock()
-        mdq.return_value = 'amq-1234'
+        mdq.return_value = sentinel.anon_queue
         mb = Mock()
 
-        self.ch._declare_exchange_point = mxp
-        self.ch._declare_queue = mdq
-        self.ch._bind = mb
+        def create_channel():
+            ch = RecvChannel()
+            ch._declare_exchange_point = mxp
+            ch._declare_queue = mdq
+            ch._bind = mb
+            return ch
+        
+        ch = create_channel()
+
+        self.assertFalse(ch._setup_listener_called)
 
         # call setup listener, defining xp, queue, default binding (will get our return value above) becuase there's no meat to _declare_queue
-        self.ch.setup_listener(('xp', 'bum'))
+        ch.setup_listener((sentinel.xp, sentinel.queue))
 
-        self.assertTrue(hasattr(self.ch, '_recv_name'))
-        self.assertEquals(self.ch._recv_name, ('xp', 'bum'))
+        self.assertTrue(hasattr(ch, '_recv_name'))
+        self.assertEquals(ch._recv_name, (sentinel.xp, sentinel.queue))
 
-        mxp.assert_called_once_with('xp')
-        mdq.assert_called_once_with('bum')
-        mb.assert_called_once_with('amq-1234')
+        mxp.assert_called_once_with(sentinel.xp)
+        mdq.assert_called_once_with(sentinel.queue)
+        mb.assert_called_once_with(sentinel.anon_queue)
+        
+        # you can only call setup_listener once
+        self.assertTrue(ch._setup_listener_called)
+        
+        # calling it again does nothing, does not touch anything
+        ch.setup_listener((sentinel.xp2, sentinel.queue2))
+
+        self.assertEquals(ch._recv_name, (sentinel.xp, sentinel.queue))
+        mxp.assert_called_once_with(sentinel.xp)
+        mdq.assert_called_once_with(sentinel.queue)
+        mb.assert_called_once_with(sentinel.anon_queue)
 
         # call setup listener, passing a custom bind this time
-        self.ch.setup_listener(('xp2', 'bum2'), binding='notbum')
+        ch = create_channel()
+        ch.setup_listener((sentinel.xp2, sentinel.queue2), binding=sentinel.binding)
 
-        mxp.assert_called_with('xp2')
-        mdq.assert_called_with('bum2')
-        mb.assert_called_with('notbum')
+        mxp.assert_called_with(sentinel.xp2)
+        mdq.assert_called_with(sentinel.queue2)
+        mb.assert_called_with(sentinel.binding)
 
         # call setup_listener, use anonymous queue name and no binding (will get return value we set above)
-        self.ch.setup_listener(('xp3', None))
+        ch = create_channel()
+        ch.setup_listener((sentinel.xp3, None))
 
-        mxp.assert_called_with('xp3')
+        mxp.assert_called_with(sentinel.xp3)
         mdq.assert_called_with(None)
-        mb.assert_called_with('amq-1234')
+        mb.assert_called_with(sentinel.anon_queue)
 
         # call setup_listener with anon queue name but with binding
-        self.ch.setup_listener(('xp4', None), binding='known')
+        ch = create_channel()
+        ch.setup_listener((sentinel.xp4, None), binding=sentinel.binding2)
 
-        mxp.assert_called_with('xp4')
+        mxp.assert_called_with(sentinel.xp4)
         mdq.assert_called_with(None)
-        mb.assert_called_with('known')
+        mb.assert_called_with(sentinel.binding2)
 
     def test__destroy_queue_no_recv_name(self):
         self.assertRaises(AssertionError, self.ch.destroy_listener)
@@ -321,6 +352,7 @@ class TestRecvChannel(PyonTestCase):
 
     @patch('pyon.net.channel.BaseChannel')
     @patch('pyon.net.channel.ChannelShutdownMessage')
+    @patch('pyon.net.channel.log', Mock())  # to avoid having to put it in signature
     def test_close_impl(self, mockshutdown, mockbasechannel):
 
         # no auto stop consuming, no auto delete of queue without recv_name set
@@ -339,6 +371,7 @@ class TestRecvChannel(PyonTestCase):
         mockbasechannel.close_impl.assert_called_once_with(self.ch)
 
     @patch('pyon.net.channel.BaseChannel')
+    @patch('pyon.net.channel.log', Mock())  # to avoid having to put it in signature
     def test_close_impl_stops_consuming(self, mockbasechannel):
         self.ch._consuming = True
         scmock = Mock()
@@ -458,11 +491,39 @@ class TestRecvChannel(PyonTestCase):
         self.assertIn(True, ac.basic_reject.call_args[1].itervalues())
 
 @attr('UNIT')
-class TestPubChannel(PyonTestCase):
-    """
-    PubChannel currently doesnt have any meat
-    """
-    pass
+@patch('pyon.net.channel.SendChannel')
+class TestPublisherChannel(PyonTestCase):
+
+    # @TODO: have to do this because i'm patching the class, anything to be done?
+    def test_verify_service(self, mocksendchannel):
+        PyonTestCase.test_verify_service(self)
+
+    def test_init(self, mocksendchannel):
+        pubchan = PublisherChannel()
+        self.assertFalse(pubchan._declared)
+
+    def test_send_no_name(self, mocksendchannel):
+        pubchan = PublisherChannel()
+        self.assertRaises(AssertionError, pubchan.send, sentinel.data)
+
+    def test_send(self, mocksendchannel):
+        depmock = Mock()
+        pubchan = PublisherChannel()
+        pubchan._declare_exchange_point = depmock
+
+        pubchan._send_name = (sentinel.xp, sentinel.routing_key)
+
+        pubchan.send(sentinel.data)
+
+        depmock.assert_called_once_with(sentinel.xp)
+        mocksendchannel.send.assert_called_once_with(pubchan, sentinel.data, headers=None)
+        self.assertTrue(pubchan._declared)
+
+        # call send again, to show declare is not called again
+        pubchan.send(sentinel.data2)
+        depmock.assert_called_once_with(sentinel.xp)
+        self.assertEquals(mocksendchannel.send.call_count, 2)
+        mocksendchannel.send.assert_called_with(pubchan, sentinel.data2, headers=None)
 
 @attr('UNIT')
 @patch('pyon.net.channel.SendChannel')

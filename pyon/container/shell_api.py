@@ -24,6 +24,8 @@ def pprint_table(table, pad=1, indent=0, trunc=None):
     Each row must have the same number of columns.
     From:http://ginstrom.com/scribbles/2007/09/04/pretty-printing-a-table-in-python/
     """
+    if len(table) == 0:
+        return ""
     strl = []
 
     col_paddings = []
@@ -84,8 +86,6 @@ def pprint_list(l, c, pad=1, indent=0):
 def ps(ret=False):
     print "List of ION processes"
     print "---------------------"
-    from pyon.service.service import services_by_name
-    #print "\n".join(("%s: %s"%(sn, sd.__class__) for (sn,sd) in services_by_name.iteritems()))
     print "\n".join(("%s: %s"%(name, p) for (name,p) in container.proc_manager.procs.iteritems()))
     if ret:
         return container.proc_manager.procs
@@ -111,8 +111,9 @@ def ms():
             else:
                 endpoint_by_group["none"].append(ep)
 
+    proclist = container.proc_manager.procs
     for name in sorted(endpoint_by_group.keys()):
-        print "%s (%s)" % (name, container.proc_manager.procs[name]._proc_name if not name == "none" else "")
+        print "%s (%s)" % (name, proclist[name]._proc_name if name in proclist else "")
         print "\n".join(("  %s, %s"%(ed.name if hasattr(ed,'name') else '', ed) for ed in sorted(endpoint_by_group[name],
                                         key=lambda ep: (ep.__class__.__name__, getattr(ep, 'name')))))
 
@@ -125,20 +126,20 @@ def svc_defs(svcs=None, op=None):
     """Returns service definitions for service name(s)
     @param svcs name or list of names of service
     """
-    from pyon.core.bootstrap import obj_registry
+    from pyon.core.bootstrap import service_registry
 
     if not getattr(svcs, '__iter__', False) and op is not None:
-        svcdef = obj_registry.services_by_name[svcs]
+        svcdef = service_registry.services[svcs]
         print "Service definition for: %s (version %s) operation %s" % (svcs, svcdef.version or 'ND', op)
-        print "".join([str(m) for m in svcdef.methods if m.op_name == op])
+        print "".join([str(o) for o in svcdef.operations if o.name == op])
         return svcdef
 
     elif svcs is not None:
         if not getattr(svcs, '__iter__', False):
             svcs = (svcs,)
         for svcname in svcs:
-            svcdef = obj_registry.services_by_name[svcname]
-            svcops = "\n     ".join(sorted([smd.op_name for smd in svcdef.methods]))
+            svcdef = service_registry.services[svcname]
+            svcops = "\n     ".join(sorted([o.name for o in svcdef.operations]))
             print "Service definition for: %s (version %s)" % (svcname, svcdef.version or 'ND')
             print "ops: %s" % (svcops)
             return svcdef
@@ -148,8 +149,8 @@ def svc_defs(svcs=None, op=None):
         print "------------------------"
         from pyon.core.bootstrap import obj_registry
 
-        for svcname in sorted(obj_registry.services_by_name.keys()):
-            svcdef = obj_registry.services_by_name[svcname]
+        for svcname in sorted(service_registry.services.keys()):
+            svcdef = service_registry.services[svcname]
             print "%s %s" % (svcname, svcdef.version)
 
         print "\nType svc_defs('name') or svc_defs(['name1','name2']) for definition"
@@ -201,11 +202,13 @@ def lsdir(qname='/', truncate=True):
     """Prints all directory entries below the given node.
     @param qname the directory node (must start with '/')
     """
-    from pyon.directory.directory import Directory
-    ds = Directory()
+    ds = container.directory
     delist = ds.find_entries(qname)
     detable = [(str(de._id), str(de.attributes)) for de in delist]
 
+    if len(detable) == 0:
+        print
+        return
     if truncate:
         rows, columns = get_console_dimensions()
         col1wid = get_max_width(detable, 0)
@@ -237,7 +240,6 @@ def get_proc():
 
 def define_vars():
     if public_vars: return public_vars
-    from pyon.core.bootstrap import CFG, sys_name, obj_registry
     cc = container
     proc, pn = get_proc()
 

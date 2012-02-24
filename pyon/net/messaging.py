@@ -8,55 +8,13 @@ from gevent import event, coros
 from pika.credentials import PlainCredentials
 from pika.connection import ConnectionParameters
 from pika.adapters import SelectConnection
-from pika import BasicProperties
 
 from pyon.core.bootstrap import CFG
 from pyon.net import amqp
 from pyon.net import channel
 from pyon.util.async import blocking_cb
 from pyon.util.log import log
-
-class IDPool(object):
-    """
-    Create a pool of IDs to allow reuse.
-    The "new_id" function generates the next valid ID from the previous one. If not given, defaults to
-    incrementing an integer.
-    """
-
-    def __init__(self, new_id=None):
-        log.debug("In IDPool.__init__")
-        if new_id is None: new_id = lambda x: x + 1
-        log.debug("new_id: %s" % str(new_id))
-
-        self.ids_in_use = set()
-        self.ids_free = set()
-        self.new_id = new_id
-        self.last_id = 0
-
-    def get_id(self):
-        log.debug("In IDPool.get_id")
-        log.debug("idsfree: %s", self.ids_free)
-        log.debug("idsinuse: %s", self.ids_in_use)
-        if len(self.ids_free) > 0:
-            #log.debug("new_id: %s" % str(new_id))
-            id = self.ids_free.pop()
-            self.ids_in_use.add(id)
-            log.debug("id: %s" % str(id))
-            return id
-
-        self.last_id = id_ = self.new_id(self.last_id)
-        self.ids_in_use.add(id_)
-        log.debug("id: %s" % str(id_))
-        return id_
-
-    def release_id(self, the_id):
-        log.debug("In IDPool.release_id")
-        log.debug("the_id: %s" % str(the_id))
-        log.debug("idsfree: %s", self.ids_free)
-        log.debug("idsinuse: %s", self.ids_in_use)
-        if the_id in self.ids_in_use:
-            self.ids_in_use.remove(the_id)
-            self.ids_free.add(the_id)
+from pyon.util.pool import IDPool
 
 class NodeB(amqp.Node):
     """
@@ -86,68 +44,65 @@ class NodeB(amqp.Node):
         self.running = 1
         self.ready.set()
 
-    def channel(self, chan):
-        log.debug("NodeB.channel")
-        with self._lock:
-            amq_chan = blocking_cb(self.client.channel, 'on_open_callback')
-            chan.on_channel_open(amq_chan)
-            #chan._close_callback = self.on_channel_request_close       # @TODO
-
+    def _new_channel(self, ch_type):
+        """
+        Creates a pyon Channel based on the passed in type, and activates it for use.
+        """
+        chan = ch_type()
+        amq_chan = blocking_cb(self.client.channel, 'on_open_callback')
+        chan.on_channel_open(amq_chan)
         return chan
 
-    def OLDchannel(self, ch_type):
-        log.debug("In NodeB.channel, pool size is %d", len(self._bidir_pool))
-        if not self.running:
-            log.error("Attempt to open channel on node that is not running")
-            raise #?
+    def channel(self, ch_type):
+        """
+        Creates a Channel object with an underlying transport callback and returns it.
 
-        log.debug("acquire semaphore")
+        @type ch_type   BaseChannel
+        """
+        log.debug("NodeB.channel")
         with self._lock:
-            log.debug("acquired semaphore")
-
-            def new_channel():
-                result = event.AsyncResult()
-                def on_channel_open_ok(amq_chan):
-                    sch = ch_type(close_callback=self.on_channel_request_close)
-                    sch.on_channel_open(amq_chan)
-                    ch = channel.SocketInterface.Socket(amq_chan, sch)
-                    result.set((ch, sch))
-                self.client.channel(on_channel_open_ok)
-                return result.get()
-
-            if ch_type == channel.BidirectionalClient:
+            # having _queue_auto_delete on is a pre-req to being able to pool.
+            if ch_type == channel.BidirClientChannel and not ch_type._queue_auto_delete:
                 chid = self._pool.get_id()
                 if chid in self._bidir_pool:
+                    log.debug("BidirClientChannel requested, pulling from pool (%d)", chid)
                     assert not chid in self._pool_map.values()
-                    self._pool_map[self._bidir_pool[chid].amq_chan.channel_number] = chid
                     ch = self._bidir_pool[chid]
-                    socket = channel.SocketInterface.Socket(ch.amq_chan, ch)
+                    self._pool_map[ch.get_channel_id()] = chid
                 else:
-                    socket, ch = new_channel()
+                    log.debug("BidirClientChannel requested, no pool items available, creating new (%d)", chid)
+                    ch = self._new_channel(ch_type)
+                    ch.set_close_callback(self.on_channel_request_close)
                     self._bidir_pool[chid] = ch
-                    self._pool_map[ch.amq_chan.channel_number] = chid
+                    self._pool_map[ch.get_channel_id()] = chid
             else:
-                socket, ch = new_channel()
+                ch = self._new_channel(ch_type)
+            assert ch
 
-            assert socket and ch
-            log.debug("sock channel: %s" % str(socket))
-
-        log.debug("release semaphore")
-
-        return socket
+        return ch
 
     def on_channel_request_close(self, ch):
-        log.debug("NodeB: on_channel_request_close")
-        log.debug("ChType %s, Ch#: %d", ch.__class__, ch.amq_chan.channel_number)
-        log.debug("MAP: %s", self._pool_map)
+        """
+        Close callback for pooled Channels.
 
-        if ch.amq_chan.channel_number in self._pool_map:
-            with self._lock:
-                chid = self._pool_map.pop(ch.amq_chan.channel_number)
-                log.debug("Releasing BiDir pool Pika #%d, our id #%d", ch.amq_chan.channel_number, chid)
-                self._pool.release_id(chid)
-        else:
-            ch.close_impl()
+        When a new, pooled Channel is created that this Node manages, it will specify this as the
+        close callback in order to prevent that Channel from actually closing.
+        """
+        log.debug("NodeB: on_channel_request_close\n\tChType %s, Ch#: %d", ch.__class__, ch.get_channel_id())
+
+        assert ch.get_channel_id() in self._pool_map
+        with self._lock:
+            ch.stop_consume()
+            chid = self._pool_map.pop(ch.get_channel_id())
+            log.debug("Releasing BiDir pool Pika #%d, our id #%d", ch.get_channel_id(), chid)
+            self._pool.release_id(chid)
+
+            # sanity check: if auto delete got turned on, we must remove this channel from the pool
+            if ch._queue_auto_delete:
+                log.warn("A pooled channel now has _queue_auto_delete set true, we must remove it: check what caused this as it's likely a timing error")
+
+                self._bidir_pool.pop(chid)
+                self._pool._ids_free.remove(chid)
 
 def ioloop(connection):
     # Loop until CTRL-C
@@ -188,151 +143,3 @@ def make_node(connection_params=None):
     return node, ioloop_process
     #return node, ioloop, connection
 
-def testb():
-    log.debug("In testb")
-    node, ioloop_process = make_node()
-    ch = node.channel(channel.BaseChannel)
-    print ch
-    ch.bind(('amq.direct', 'foo'))
-    print 'bound'
-    ch.listen(1)
-    print 'listening'
-    msg = ch.recv()
-    print 'message: ', msg
-    ioloop_process.join()
-
-def testbclient():
-    log.debug("In testbclient")
-    node, ioloop_process = make_node()
-    ch = node.channel(channel.BidirectionalClient)
-    print ch
-    ch.connect(('amq.direct', 'foo'))
-    print 'sending'
-    ch.send('hey, whats up?')
-    print 'sent'
-    print 'receiving'
-    msg = ch.recv()
-    print 'message: ', msg
-
-def test_accept():
-    log.debug("In test_accept")
-    node, ioloop_process = make_node()
-    ch = node.channel(channel.Bidirectional)
-    print ch
-    ch.bind(('amq.direct', 'foo'))
-    print 'bound'
-    ch.listen(1)
-    ch_serv = ch.accept() # do we need the name of the connected peer?
-    print 'accepted'
-    msg = ch_serv.recv()
-    print 'message: ', msg
-    ch_serv.send('not much, dude')
-
-    ioloop_process.join()
-
-class NodeNB(amqp.Node):
-    """
-    Main non blocking messaging interface that goes active when amqp client connects.
-    Integrates messaging and processing
-
-    The life cycle of this depends on the underlying amqp connection.
-
-    This thing (or a subordinate but coupled/controlled object) mediates
-    Messaging Channels that are used to send messages or that dispatch
-    received messages to receiver/consumer protocol things.
-    """
-
-    def __init__(self):
-        log.debug("In NodeNB.__init__")
-        self.channels = {}
-        self.id_pool = IDPool()
-
-    def start_node(self):
-        """
-        This should only be called by on_connection_opened..
-        so, maybe we don't need a start_node/stop_node interface
-        """
-        log.debug("In NodeNB.start_node")
-        amqp.Node.start_node(self)
-        for ch_id in self.channels:
-            self.start_channel(ch_id)
-
-    def stop_node(self):
-        """
-        """
-        log.debug("In NodeNB.stop_node")
-
-    def channel(self, ch_type):
-        """
-        ch_type is one of PointToPoint, etc.
-        return Channel instance that will be activated with amqp_channel
-        and configured
-
-        name (exchange, key)
-        name shouldn't need to be specified here, but it is for now
-        """
-        log.debug("In NodeNB.channel")
-        ch = ch_type()
-        ch_id = self.id_pool.get_id()
-        log.debug("channel id: %s" % str(ch_id))
-        self.channels[ch_id] = ch
-        if self.running:
-            self.start_channel(ch_id)
-        log.debug("channel: %s" % str(ch))
-        return ch
-
-    def start_channel(self, ch_id):
-        log.debug("In NodeNB.start_channel")
-        log.debug("ch_id: %s" % str(ch_id))
-        ch = self.channels[ch_id]
-        log.debug("ch: %s" % str(ch))
-        self.client.channel(ch.on_channel_open)
-
-    def spawnServer(self, f):
-        """
-        """
-        log.debug("In spawnServer")
-
-class TestServer(channel.BaseChannel):
-
-    def do_config(self):
-        log.debug("In TestServer.do_config")
-        self._chan_name = ('amq.direct', 'foo')
-        self.queue = 'foo'
-        self.do_queue()
-
-class TestClient(channel.BaseChannel):
-
-    def do_config(self):
-        log.debug("In TestClient.do_config")
-        self._peer_name = ('amq.direct', 'foo')
-        self.send('test message')
-
-
-def testnb():
-    log.debug("In testnb")
-    node = NodeNB()
-    #ch = node.channel(('amq.direct', 'foo'), TestServer)
-    ch = node.channel(TestServer)
-    #ch = node.channel(TestClient)
-    conn_parameters = ConnectionParameters()
-    connection = SelectConnection(conn_parameters , node.on_connection_open)
-    # Loop until CTRL-C
-    try:
-        # Start our blocking loop
-        connection.ioloop.start()
-
-    except KeyboardInterrupt:
-
-        # Close the connection
-        connection.close()
-
-        # Loop until the connection is closed
-        connection.ioloop.start()
-
-
-if __name__ == '__main__':
-    #testnb()
-    #testb()
-    testbclient()
-    #test_accept()

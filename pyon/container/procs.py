@@ -1,17 +1,21 @@
 #!/usr/bin/env python
 
 """Part of the container that manages ION processes etc."""
+from pyon.core import exception
 
 __author__ = 'Michael Meisinger'
 
 from zope.interface import implementedBy
 
+from pyon.agent.agent import ResourceAgent
 from pyon.core.bootstrap import CFG
+from pyon.core.exception import ContainerConfigError, BadRequest
 from pyon.ion.endpoint import ProcessRPCServer, ProcessRPCClient, ProcessSubscriber
+from pyon.ion.endpoint import StreamSubscriberRegistrar, StreamSubscriberRegistrarError, StreamPublisher, StreamPublisherRegistrar
 from pyon.ion.process import IonProcessSupervisor
 from pyon.net.messaging import IDPool
-from pyon.service.service import BaseService, get_service_by_name
-from pyon.util.containers import DictModifier, DotDict, for_name
+from pyon.service.service import BaseService
+from pyon.util.containers import DictModifier, DotDict, for_name, named_any, dict_merge, get_safe
 from pyon.util.log import log
 
 
@@ -20,7 +24,7 @@ class ProcManager(object):
         self.container = container
 
         # Define the callables that can be added to Container public API
-        self.container_api = [self.spawn_process]
+        self.container_api = [self.spawn_process, self.terminate_process]
 
         # Add the public callables to Container
         for call in self.container_api:
@@ -32,8 +36,11 @@ class ProcManager(object):
         self.procs_by_name = {}
         self.procs = {}
 
+        # mapping of greenlets we spawn to service_instances for error handling
+        self._spawned_proc_to_process = {}
+
         # The pyon worker process supervisor
-        self.proc_sup = IonProcessSupervisor(heartbeat_secs=CFG.cc.timeout.heartbeat)
+        self.proc_sup = IonProcessSupervisor(heartbeat_secs=CFG.cc.timeout.heartbeat, failure_notify_callback=self._spawned_proc_failed)
 
     def start(self):
         log.debug("ProcManager starting ...")
@@ -56,23 +63,34 @@ class ProcManager(object):
         self.proc_sup.shutdown(CFG.cc.timeout.shutdown)
         log.debug("ProcManager stopped, OK.")
 
-    def spawn_process(self, name=None, module=None, cls=None, config=None, process_type=None):
+    def spawn_process(self, name=None, module=None, cls=None, config=None):
         """
         Spawn a process within the container. Processes can be of different type.
         """
         # Generate a new process id
         # TODO: Ensure it is system-wide unique
-        process_id = str(self.proc_id_pool.get_id())
-        log.debug("ProcManager.spawn_process(name=%s, module.cls=%s.%s) as pid=%s" % (name, module, cls, process_id))
+        process_id =  "%s.%s" % (self.container.id, self.proc_id_pool.get_id())
+        log.debug("ProcManager.spawn_process(name=%s, module.cls=%s.%s) as pid=%s", name, module, cls, process_id)
 
-        if config is None:
+        if not config:
+            # Use system CFG. It has the command line args in it
             config = DictModifier(CFG)
+        else:
+            # Use provided config. Must be dict or DotDict
+            if not isinstance(config, DotDict):
+                config = DotDict(config)
+            config = DictModifier(CFG, config)
+            if self.container.spawn_args:
+                # Override config with spawn args
+                dict_merge(config, self.container.spawn_args, inplace=True)
 
         log.debug("spawn_process() pid=%s config=%s", process_id, config)
 
-        # PROCESS TYPE.
+        # PROCESS TYPE. Determines basic process context (messaging, service interface)
         # One of: service, stream_process, agent, simple, immediate
-        process_type = process_type or config.get("process", {}).get("type", "service")
+
+        service_cls = named_any("%s.%s" % (module, cls))
+        process_type = get_safe(config, "process.type") or getattr(service_cls, "process_type", "service")
 
         service_instance = None
         try:
@@ -86,6 +104,9 @@ class ProcManager(object):
             elif process_type == "agent":
                 service_instance = self._spawn_agent_process(process_id, name, module, cls, config)
 
+            elif process_type == "standalone":
+                service_instance = self._spawn_standalone_process(process_id, name, module, cls, config)
+
             elif process_type == "immediate":
                 service_instance = self._spawn_immediate_process(process_id, name, module, cls, config)
 
@@ -93,19 +114,39 @@ class ProcManager(object):
                 service_instance = self._spawn_simple_process(process_id, name, module, cls, config)
 
             else:
-                raise Exception("Unknown process type: %s" % process_type)
+                raise BadRequest("Unknown process type: %s" % process_type)
 
             service_instance._proc_type = process_type
             self._register_process(service_instance, name)
 
             service_instance.errcause = "OK"
             log.info("AppManager.spawn_process: %s.%s -> pid=%s OK" % (module, cls, process_id))
-            return True
+            return service_instance.id
 
         except Exception:
             errcause = service_instance.errcause if service_instance else "instantiating service"
-            log.exception("Error spawning process %s: %s" % (process_id, errcause))
-            return False
+            log.exception("Error spawning %s %s process (process_id: %s): %s" % (name, process_type, process_id, errcause))
+            raise
+
+    def _spawned_proc_failed(self, proc_sup, gproc):
+        log.error("ProcManager._spawned_proc_failed: %s", gproc)
+
+        # for now - don't worry about the mapping, if we get a failure, just kill the container.
+        # leave the mapping in place for potential expansion later.
+
+#        # look it up in mapping
+#        if not gproc in self._spawned_proc_to_process:
+#            log.warn("No record of gproc %s in our map (%s)", gproc, self._spawned_proc_to_process)
+#            return
+#
+        svc = self._spawned_proc_to_process.get(gproc, "Unknown")
+#
+#        # make sure svc is in our list
+#        if not svc in self.procs.values():
+#            log.warn("svc %s not found in procs list", svc)
+#            return
+
+        self.container.fail_fast("Container process (%s) failed: %s" % (svc, gproc.exception))
 
     def _spawn_service_process(self, process_id, name, module, cls, config):
         """
@@ -114,10 +155,18 @@ class ProcManager(object):
         """
         service_instance = self._create_service_instance(process_id, name, module, cls, config)
         self._service_init(service_instance)
-        listen_name = config.get("process", {}).get("listen_name", name)
+
+        listen_name = get_safe(config, "process.listen_name") or service_instance.name
+        log.debug("Service Process (%s) listen_name: %s", name, listen_name)
+
         self._set_service_endpoint(service_instance, listen_name)
         self._set_service_endpoint(service_instance, service_instance.id)
         self._service_start(service_instance)
+
+        # Directory registration
+        self.container.directory.register_safe("/Services", listen_name, interface=service_instance.name)
+        self.container.directory.register_safe("/Services/%s" % listen_name, service_instance.id)
+
         return service_instance
 
     def _spawn_stream_process(self, process_id, name, module, cls, config):
@@ -127,9 +176,18 @@ class ProcManager(object):
         """
         service_instance = self._create_service_instance(process_id, name, module, cls, config)
         self._service_init(service_instance)
-        listen_name = config.get("process", {}).get("listen_name", name)
+
+        listen_name = get_safe(config, "process.listen_name") or name
+        # Throws an exception if no listen name is given!
         self._set_subscription_endpoint(service_instance, listen_name)
+
+        # Add publishers if any...
+        publish_streams = get_safe(config, "process.publish_streams")
+        self._set_publisher_endpoints(service_instance, publish_streams)
+
+        # Start the service
         self._service_start(service_instance)
+
         return service_instance
 
     def _spawn_agent_process(self, process_id, name, module, cls, config):
@@ -138,8 +196,26 @@ class ProcManager(object):
         Attach to service pid.
         """
         service_instance = self._create_service_instance(process_id, name, module, cls, config)
+        if not isinstance(service_instance, ResourceAgent):
+            raise ContainerConfigError("Agent process must extend ResourceAgent")
         self._service_init(service_instance)
         self._set_service_endpoint(service_instance, service_instance.id)
+        self._service_start(service_instance)
+        return service_instance
+
+    def _spawn_standalone_process(self, process_id, name, module, cls, config):
+        """
+        Spawn a process acting as standalone process.
+        Attach to service pid.
+        """
+        service_instance = self._create_service_instance(process_id, name, module, cls, config)
+        self._service_init(service_instance)
+        self._set_service_endpoint(service_instance, service_instance.id)
+
+        # Add publishers if any...
+        publish_streams = get_safe(config, "process.publish_streams")
+        self._set_publisher_endpoints(service_instance, publish_streams)
+
         self._service_start(service_instance)
         return service_instance
 
@@ -150,6 +226,11 @@ class ProcManager(object):
         """
         service_instance = self._create_service_instance(process_id, name, module, cls, config)
         self._service_init(service_instance)
+
+        # Add publishers if any...
+        publish_streams = get_safe(config, "process.publish_streams")
+        self._set_publisher_endpoints(service_instance, publish_streams)
+
         self._service_start(service_instance)
         return service_instance
 
@@ -166,11 +247,12 @@ class ProcManager(object):
     def _create_service_instance(self, process_id, name, module, cls, config):
         # SERVICE INSTANCE.
         service_instance = for_name(module, cls)
-        assert isinstance(service_instance, BaseService), "Instantiated service not a BaseService %r" % service_instance
+        if not isinstance(service_instance, BaseService):
+            raise ContainerConfigError("Instantiated service not a BaseService %r" % service_instance)
 
         # Prepare service instance
         service_instance.errcause = ""
-        service_instance.id = "%s.%s" % (self.container.id, process_id)
+        service_instance.id = process_id
         service_instance.container = self.container
         service_instance.CFG = config
         service_instance._proc_name = name
@@ -212,22 +294,41 @@ class ProcManager(object):
                                 service=service_instance,
                                 process=service_instance)
         # Start an ION process with the right kind of endpoint factory
-        self.proc_sup.spawn((CFG.cc.proctype or 'green', None), listener=rsvc, name=listen_name)
-        rsvc.get_ready_event().wait(timeout=10)
+        proc = self.proc_sup.spawn((CFG.cc.proctype or 'green', None), listener=rsvc, name=listen_name,
+                                    proc_name=service_instance._proc_name)
+        self.proc_sup.ensure_ready(proc, "_set_service_endpoint for listen_name: %s" % listen_name)
+
+        # map gproc to service_instance
+        self._spawned_proc_to_process[proc.proc] = service_instance
+
         log.debug("Process %s service listener ready: %s", service_instance.id, listen_name)
 
     def _set_subscription_endpoint(self, service_instance, listen_name):
         service_instance.errcause = "setting process subscription endpoint"
 
-        # Start pubsub listener
-        # TODO: Use Refactored ION endpoint for streams once ready.
-        sub = ProcessSubscriber(node=self.container.node,
-                         name=listen_name,
-                         process=service_instance,
-                         callback=lambda m,h: service_instance.process(m))
-        self.proc_sup.spawn((CFG.cc.proctype or 'green', None), listener=sub, name=listen_name)
-        sub.get_ready_event().wait(timeout=10)
+        service_instance.stream_subscriber_registrar = StreamSubscriberRegistrar(process=service_instance, node=self.container.node)
+
+        sub = service_instance.stream_subscriber_registrar.create_subscriber(exchange_name=listen_name,callback=lambda m,h: service_instance.process(m))
+
+        proc = self.proc_sup.spawn((CFG.cc.proctype or 'green', None), listener=sub, name=listen_name,
+                                    proc_name=service_instance._proc_name)
+        self.proc_sup.ensure_ready(proc, '_set_subscription_endpoint for listen_name: %s' % listen_name)
+
+        # map gproc to service_instance
+        self._spawned_proc_to_process[proc.proc] = service_instance
+
         log.debug("Process %s stream listener ready: %s", service_instance.id, listen_name)
+
+    def _set_publisher_endpoints(self, service_instance, publisher_streams=None):
+        service_instance.stream_publisher_registrar = StreamPublisherRegistrar(process=service_instance, node=self.container.node)
+
+        publisher_streams = publisher_streams or {}
+
+        for name, stream_id in publisher_streams.iteritems():
+            # problem is here
+            pub = service_instance.stream_publisher_registrar.create_publisher(stream_id)
+
+            setattr(service_instance, name, pub)
 
     def _register_process(self, service_instance, name):
         # Add to local process dict
@@ -236,14 +337,35 @@ class ProcManager(object):
 
         # Add to directory
         service_instance.errcause = "registering"
-        self.container.directory.register("/Containers/%s/Processes" % self.container.id,
-                                          service_instance.id, name=name)
+        self.container.directory.register_safe("/Containers/%s/Processes" % self.container.id,
+                                               service_instance.id, name=name)
 
     def terminate_process(self, process_id):
         service_instance = self.procs.get(process_id, None)
-        if not service_instance: return
+        if not service_instance:
+            raise BadRequest("Cannot terminate. Process id='%s' unknown on container id='%s'" % (
+                                        process_id, self.container.id))
 
         service_instance.quit()
-        # TODO: Cleanup messaging attachments
+
+        # find the proc
+        lp = list(self.proc_sup.children)
+        lps = [p for p in lp if p.listener._process == service_instance]
+
+
+        for p in lps:
+            p.notify_stop()
+            p.stop()
 
         del self.procs[process_id]
+
+        self.container.directory.unregister_safe("/Containers/%s/Processes" % self.container.id,
+                service_instance.id)
+
+        # For service workers
+        if service_instance._proc_type == "service":
+            listen_name = get_safe(service_instance.CFG, "process.listen_name", service_instance.name)
+            self.container.directory.unregister_safe("/Services/%s" % listen_name, service_instance.id)
+            remaining_workers = self.container.directory.find_entries("/Services/%s" % listen_name)
+            if remaining_workers and len(remaining_workers) == 2:
+                self.container.directory.unregister_safe("/Services", listen_name)
